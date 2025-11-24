@@ -4,100 +4,156 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Utility functions for calculations
-function classifyCostsLineItems(items) {
-  // items: [{name, amount, typeDirect:boolean, fixed:boolean, controllable:boolean, centre}]
-  const summary = {
-    direct: 0,
-    indirect: 0,
-    fixed: 0,
-    variable: 0,
-    controllable: 0,
-    uncontrollable: 0
-  };
-  items.forEach(it => {
-    if (it.typeDirect) summary.direct += it.amount;
-    else summary.indirect += it.amount;
-    if (it.fixed) summary.fixed += it.amount;
-    else summary.variable += it.amount;
-    if (it.controllable) summary.controllable += it.amount;
-    else summary.uncontrollable += it.amount;
-  });
-  return summary;
-}
+// Helper: Sum helper for arrays
+const sumItems = (arr) => (arr || []).reduce((s, i) => s + (Number(i.amount) || 0), 0);
 
 function contractCosting(payload) {
-  // payload contains: materials, wages, expenses, overheads, contractPrice, workCertified, cashReceived, retentionPercent, escalationPercent
-  const {materials, wages, expenses, overheads, contractPrice, workCertified, cashReceived, retentionPercent, escalationPercent, materialsIncreasePercent} = payload;
-  const directMaterials = materials.reduce((s,i)=>s + (i.amount||0),0);
-  const directWages = wages.reduce((s,i)=>s + (i.amount||0),0);
-  const directExpenses = expenses.reduce((s,i)=>s + (i.amount||0),0);
-  const indirectOverheads = overheads.reduce((s,i)=>s + (i.amount||0),0);
+  const {
+    materials, wages, expenses,              // Direct Costs
+    factoryOverheads,                        // Factory/Works Overheads
+    adminOverheads,                          // Office/Admin Overheads
+    sellingOverheads,                        // Selling & Dist. Overheads
+    contractPrice, workCertified, cashReceived, 
+    retentionPercent, escalationPercent, materialsIncreasePercent
+  } = payload;
+
+  // 1. Prime Cost (Direct Material + Direct Labour + Direct Expenses)
+  const directMaterials = sumItems(materials);
+  const directWages = sumItems(wages);
+  const directExpenses = sumItems(expenses);
   const primeCost = directMaterials + directWages + directExpenses;
-  const worksCost = primeCost + indirectOverheads;
-  const materialEscalation = directMaterials * (materialsIncreasePercent/100);
 
-  // Notional profit = Work Certified + Materials at site (we'll keep simplified: contractPrice - worksCost)
-  const notionalProfit = Math.max(0, contractPrice - worksCost);
+  // 2. Factory Cost / Works Cost (Prime Cost + Factory Overheads)
+  const factoryOverheadTotal = sumItems(factoryOverheads);
+  // Note: In a full sheet, you would adjust for Opening/Closing WIP here. 
+  // We assume Work Certified covers the output value, but for Costing side:
+  const worksCost = primeCost + factoryOverheadTotal;
 
-  const retentionMoney = (workCertified * (retentionPercent/100));
-  const recognisedProfit = Math.round(notionalProfit * (2/3) * (cashReceived / workCertified));
+  // 3. Cost of Production (Works Cost + Admin Overheads)
+  const adminOverheadTotal = sumItems(adminOverheads);
+  const costOfProduction = worksCost + adminOverheadTotal;
+
+  // 4. Cost of Sales / Total Cost (CoP + Selling Overheads)
+  const sellingOverheadTotal = sumItems(sellingOverheads);
+  const costOfSales = costOfProduction + sellingOverheadTotal;
+
+  // --- Contract Specific Calculations ---
+  
+  // Escalation Logic
+  const materialEscalation = directMaterials * ((materialsIncreasePercent || 0) / 100);
+
+  // Profit Logic
+  // Notional Profit = Value of Work (Work Certified) - Cost Incurred up to date
+  // For safety, we usually use Works Cost or Total Cost depending on policy. 
+  // Here we use Cost of Production as the basis for cost incurred.
+  const notionalProfit = Math.max(0, (workCertified || 0) - costOfProduction);
+
+  // Retention Money
+  const retentionMoney = (workCertified * ((retentionPercent || 0) / 100));
+
+  // Recognised Profit (Standard Formula: NP * 2/3 * Cash/Certified)
+  const recognisedProfit = Math.round(notionalProfit * (2 / 3) * ((cashReceived || 0) / (workCertified || 1)));
 
   return {
-    directMaterials,
-    directWages,
-    directExpenses,
-    indirectOverheads,
-    primeCost,
-    worksCost,
-    materialEscalation,
-    notionalProfit,
-    retentionMoney,
-    recognisedProfit
+    breakdown: {
+      directMaterials,
+      directWages,
+      directExpenses,
+      primeCost,            // Step 1
+      factoryOverheadTotal,
+      worksCost,            // Step 2
+      adminOverheadTotal,
+      costOfProduction,     // Step 3
+      sellingOverheadTotal,
+      costOfSales           // Step 4 (Total Cost)
+    },
+    contractMetrics: {
+      materialEscalation,
+      notionalProfit,
+      retentionMoney,
+      recognisedProfit
+    }
   };
 }
 
 function jobCosting(payload) {
-  // payload: array of modules with itemized lists
   const modules = payload.modules || [];
+
   const breakdown = modules.map(m => {
-    const directMaterial = (m.materials||[]).reduce((s,i)=>s + (i.amount||0),0);
-    const directLabour = (m.labour||[]).reduce((s,i)=>s + (i.amount||0),0);
-    const directExpenses = (m.expenses||[]).reduce((s,i)=>s + (i.amount||0),0);
-    const factoryOverhead = m.factoryOverheadPercent? (directMaterial + directLabour + directExpenses) * (m.factoryOverheadPercent/100):0;
-    const adminOverhead = m.adminOverheadPercent? (directMaterial + directLabour + directExpenses) * (m.adminOverheadPercent/100):0;
-    const totalCost = directMaterial + directLabour + directExpenses + factoryOverhead + adminOverhead;
-    const profit = m.profitPercent? totalCost * (m.profitPercent/100):0;
-    return {...m, directMaterial, directLabour, directExpenses, factoryOverhead, adminOverhead, totalCost, profit, sellingPrice: totalCost + profit};
+    // 1. Prime Cost
+    const directMaterial = sumItems(m.materials);
+    const directLabour = sumItems(m.labour);
+    const directExpenses = sumItems(m.expenses);
+    const primeCost = directMaterial + directLabour + directExpenses;
+
+    // 2. Factory Cost
+    // If percent is provided, calc based on Prime Cost, else use raw amount if you add that feature later
+    const factoryOverhead = m.factoryOverheadPercent 
+      ? primeCost * (m.factoryOverheadPercent / 100) 
+      : 0;
+    const worksCost = primeCost + factoryOverhead;
+
+    // 3. Cost of Production
+    const adminOverhead = m.adminOverheadPercent 
+      ? worksCost * (m.adminOverheadPercent / 100) 
+      : 0;
+    const costOfProduction = worksCost + adminOverhead;
+
+    // 4. Total Cost (Cost of Sales)
+    // Assuming Selling overhead is 0 for internal IT jobs usually, but adding for consistency
+    const sellingOverhead = m.sellingOverheadPercent 
+      ? costOfProduction * (m.sellingOverheadPercent / 100) 
+      : 0;
+    const totalCost = costOfProduction + sellingOverhead;
+
+    // Profit & Price
+    const profit = m.profitPercent ? totalCost * (m.profitPercent / 100) : 0;
+    const sellingPrice = totalCost + profit;
+
+    return {
+      name: m.name,
+      directMaterial,
+      directLabour,
+      directExpenses,
+      primeCost,
+      factoryOverhead,
+      worksCost,
+      adminOverhead,
+      costOfProduction,
+      sellingOverhead,
+      totalCost,
+      profit,
+      sellingPrice
+    };
   });
-  const total = breakdown.reduce((s,b)=>s + b.totalCost + b.profit,0);
-  return {breakdown, total};
+
+  const grandTotal = breakdown.reduce((s, b) => s + b.totalCost, 0);
+  const grandPrice = breakdown.reduce((s, b) => s + b.sellingPrice, 0);
+
+  return { breakdown, grandTotal, grandPrice };
 }
 
-// API endpoints
+// --- API Endpoints ---
+
 app.post('/api/simulate/contract', (req, res) => {
   try {
     const result = contractCosting(req.body);
-    res.json({ok:true, result});
-  } catch(e) {
-    res.status(500).json({ok:false, error: e.message});
+    res.json({ ok: true, result });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 app.post('/api/simulate/job', (req, res) => {
   try {
     const result = jobCosting(req.body);
-    res.json({ok:true, result});
-  } catch(e) {
-    res.status(500).json({ok:false, error: e.message});
+    res.json({ ok: true, result });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/api/classify', (req,res)=>{
-  // classify arbitrary line items
-  const items = req.body.items || [];
-  res.json({ok:true, result: classifyCostsLineItems(items)});
-});
-
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, ()=> console.log(`Costing simulator backend running on ${PORT}`));
+app.listen(PORT, () => console.log(`Costing simulator backend running on ${PORT}`));
